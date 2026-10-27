@@ -1,0 +1,9 @@
+[project]
+name = "pdf-audiobook"
+version = "0.1.0"
+dependencies = [
+  "flet",
+  "flet-audio",
+  "PyPDF2",
+  "gTTS",
+]

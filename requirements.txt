@@ -1,0 +1,3 @@
+flet
+PyPDF2
+gTTS
