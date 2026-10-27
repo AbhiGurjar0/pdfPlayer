@@ -14,8 +14,8 @@ from gtts import gTTS
 from mutagen.mp3 import MP3
 
 # ---------------- settings ----------------
-VOICE = "en-US-AvaMultilingualNeural"
-RATE = "+0%"              # "-10%" slower, "+10%" faster
+VOICE = "en-GB-SoniaNeural"
+RATE = "-7%"              # "-10%" slower, "+10%" faster
 PREFETCH_AHEAD = 40       # how many pages ahead to prepare
 WORKERS = 2               # pages converted at the same time
 RETRIES = 3               # tries per page before falling back to gTTS
