@@ -7,4 +7,5 @@ dependencies = [
   "PyPDF2",
   "gTTS",
   "edge-tts",
+  "mutagen",
 ]
