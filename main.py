@@ -1,10 +1,12 @@
 import asyncio
+import hashlib
 import io
+import json
 import os
 import re
-import tempfile
+import shutil
 import time
-import uuid
+import unicodedata
 
 import edge_tts
 import flet as ft
@@ -16,11 +18,13 @@ from mutagen.mp3 import MP3
 # ---------------- settings ----------------
 VOICE = "en-GB-SoniaNeural"
 RATE = "-7%"              # "-10%" slower, "+10%" faster
+VOICE_TAG = f"{VOICE}|{RATE}"   # saved audio is rebuilt if you change voice or rate
 PREFETCH_AHEAD = 40       # how many pages ahead to prepare
 WORKERS = 2               # pages converted at the same time
-RETRIES = 3               # tries per page before falling back to gTTS
-REQUEST_TIMEOUT = 60      # seconds per try
+RETRIES = 3               # tries per piece of text before giving up
+REQUEST_TIMEOUT = 30      # seconds per try
 RETRY_COOLDOWN = 20       # seconds before a failed page is tried again
+MAX_AUTO_RETRIES = 5      # then wait until you tap that page yourself
 CHUNK_CHARS = 2500        # long pages are sent in pieces
 SKIP_SECONDS = 10         # seconds for the skip back / forward buttons
 
@@ -40,29 +44,148 @@ WAIT_YELLOW = "#FFE29A"
 ERR_RED = "#FFA3AE"
 
 
+# ---------------- storage (saved books) ----------------
+_ROOT = None
+
+
+def get_root():
+    """Folder that survives app restarts (phone: app data folder, Mac: ~/.pdf_audiobook)."""
+    global _ROOT
+    if _ROOT is None:
+        base = os.getenv("FLET_APP_STORAGE_DATA") or os.path.join(
+            os.path.expanduser("~"), ".pdf_audiobook"
+        )
+        _ROOT = os.path.join(base, "library")
+        os.makedirs(_ROOT, exist_ok=True)
+    return _ROOT
+
+
+def book_dir(book_id):
+    return os.path.join(get_root(), book_id)
+
+
+def audio_dir(book_id):
+    return os.path.join(book_dir(book_id), "audio")
+
+
+def audio_file(book_id, idx):
+    return os.path.join(audio_dir(book_id), f"p{idx:04d}.mp3")
+
+
+def read_json(path, default=None):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def write_json(path, obj):
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def load_meta(book_id):
+    return read_json(os.path.join(book_dir(book_id), "meta.json"))
+
+
+def save_meta(meta):
+    write_json(os.path.join(book_dir(meta["id"]), "meta.json"), meta)
+
+
+def load_pages(book_id):
+    return read_json(os.path.join(book_dir(book_id), "pages.json"), [])
+
+
+def scan_audio(book_id):
+    """Which pages already have saved audio: {page index: path}."""
+    found = {}
+    d = audio_dir(book_id)
+    if not os.path.isdir(d):
+        return found
+    for name in os.listdir(d):
+        m = re.fullmatch(r"p(\d+)\.mp3", name)
+        if m:
+            path = os.path.join(d, name)
+            if os.path.getsize(path) > 0:
+                found[int(m.group(1))] = path
+    return found
+
+
+def clear_audio(book_id):
+    shutil.rmtree(audio_dir(book_id), ignore_errors=True)
+    os.makedirs(audio_dir(book_id), exist_ok=True)
+
+
+def list_books():
+    books = []
+    root = get_root()
+    for name in os.listdir(root):
+        meta = load_meta(name)
+        if not meta:
+            continue
+        found = scan_audio(name)
+        size = sum(os.path.getsize(p) for p in found.values() if os.path.exists(p))
+        meta["audio_ready"] = len(found)
+        meta["audio_bytes"] = size
+        books.append(meta)
+    books.sort(key=lambda m: m.get("last_opened", 0), reverse=True)
+    return books
+
+
+def import_pdf(data: bytes, name: str):
+    """Parse once, save the text. Same PDF again = opens the saved copy."""
+    book_id = hashlib.sha1(data).hexdigest()[:12]
+    if load_meta(book_id) and os.path.exists(os.path.join(book_dir(book_id), "pages.json")):
+        return book_id, False
+    pages = extract_pages(data)
+    if not pages:
+        raise ValueError("No readable text found. Scanned (image-only) PDFs are not supported.")
+    os.makedirs(audio_dir(book_id), exist_ok=True)
+    write_json(os.path.join(book_dir(book_id), "pages.json"), pages)
+    now = time.time()
+    save_meta({
+        "id": book_id, "name": name, "n_pages": len(pages),
+        "last_page": 0, "added": now, "last_opened": now, "voice_tag": VOICE_TAG,
+    })
+    return book_id, True
+
+
+def delete_book(book_id):
+    shutil.rmtree(book_dir(book_id), ignore_errors=True)
+
+
 # ---------------- text / pdf helpers ----------------
 def clean_text(t: str) -> str:
-    t = re.sub(r"(\w)-\s+(\w)", r"\1\2", t)   # "exam- ple" -> "example"
+    t = unicodedata.normalize("NFKC", t)                        # ligatures: fi -> fi
+    t = "".join(
+        ch for ch in t
+        if ch in "\n\t " or unicodedata.category(ch) not in ("Cc", "Cf", "Cs", "Co")
+    )                                                           # control / invisible chars
+    t = re.sub(r"(\w)-\s+(\w)", r"\1\2", t)                     # "exam- ple" -> "example"
+    t = re.sub(r"[.\u2026\u00b7\u2022_=~*\-]{4,}", " ", t)      # dotted leaders, rules
     t = re.sub(r"\s+", " ", t)
     return t.strip()
 
 
-def extract_pages(source):
-    """source: file path (str) or raw bytes."""
+def extract_pages(data: bytes):
+    reader = PyPDF2.PdfReader(io.BytesIO(data))
+    if reader.is_encrypted:
+        try:
+            reader.decrypt("")
+        except Exception:
+            raise ValueError("This PDF is password protected.")
     pages = []
-    if isinstance(source, (bytes, bytearray)):
-        reader = PyPDF2.PdfReader(io.BytesIO(source))
-        for p in reader.pages:
-            t = p.extract_text()
-            if t and re.search(r"\w", t):
-                pages.append(t.replace("\n", " "))
-    else:
-        with open(source, "rb") as f:
-            reader = PyPDF2.PdfReader(f)
-            for p in reader.pages:
-                t = p.extract_text()
-                if t and re.search(r"\w", t):
-                    pages.append(t.replace("\n", " "))
+    for p in reader.pages:
+        try:
+            t = p.extract_text() or ""
+        except Exception:
+            t = ""                       # one bad page must not stop the whole book
+        t = clean_text(t)
+        if len(re.findall(r"[^\W_]", t)) >= 3:
+            pages.append(t)
     return pages
 
 
@@ -96,33 +219,66 @@ def short(text, n=420):
     return text if len(text) <= n else text[:n].rsplit(" ", 1)[0] + "..."
 
 
+def err_text(err, n=110):
+    """Always says what kind of error it was, even when the message is empty
+    (a timeout has an empty message, which is why errors looked 'unknown')."""
+    msg = str(err).strip()
+    name = type(err).__name__
+    return f"{name}: {msg}"[:n] if msg else name
+
+
 # ---------------- speech helpers ----------------
-async def edge_to_file(text, path):
+async def fetch_chunk(chunk):
+    comm = edge_tts.Communicate(chunk, VOICE, rate=RATE)
+    data = bytearray()
+    async for item in comm.stream():
+        if item["type"] == "audio":
+            data += item["data"]
+    if not data:
+        raise RuntimeError("no audio received")
+    return bytes(data)
+
+
+async def edge_page(text, path):
     with open(path, "wb") as f:
         for chunk in split_text(text):
-            comm = edge_tts.Communicate(chunk, VOICE, rate=RATE)
-            async for item in comm.stream():
-                if item["type"] == "audio":
-                    f.write(item["data"])
+            if not re.search(r"\w", chunk):
+                continue
+            last = None
+            for attempt in range(RETRIES):
+                try:
+                    # timeout is per piece, so long pages are not cut off
+                    f.write(await asyncio.wait_for(fetch_chunk(chunk), REQUEST_TIMEOUT))
+                    break
+                except Exception as err:
+                    last = err
+                    await asyncio.sleep(2 * (attempt + 1))
+            else:
+                raise last
     if os.path.getsize(path) == 0:
-        raise RuntimeError("no audio received")
+        raise RuntimeError("nothing readable on this page")
 
 
 def gtts_to_file(text, path):
     gTTS(text=text, lang="en").save(path)
 
 
-async def synthesize(text, path):
-    """Neural voice with retries; falls back to gTTS if it keeps failing."""
+async def synthesize(text, path, allow_fallback):
+    """Neural voice with retries. The basic gTTS voice is used only as a last
+    resort, and only when you are waiting for that page."""
     text = clean_text(text)
-    for attempt in range(RETRIES):
+    try:
+        await edge_page(text, path)
+        return "edge"
+    except Exception as e1:
+        edge_err = err_text(e1)
+        if not allow_fallback:
+            raise RuntimeError(f"Edge voice failed ({edge_err})")
         try:
-            await asyncio.wait_for(edge_to_file(text, path), REQUEST_TIMEOUT)
-            return "edge"
-        except Exception:
-            await asyncio.sleep(1.5 * (attempt + 1))
-    await asyncio.to_thread(gtts_to_file, text, path)
-    return "gtts"
+            await asyncio.wait_for(asyncio.to_thread(gtts_to_file, text, path), 90)
+            return "gtts"
+        except Exception as e2:
+            raise RuntimeError(f"Edge: {edge_err} | gTTS: {err_text(e2, 60)}")
 
 
 def mp3_duration(path):
@@ -140,24 +296,27 @@ def main(page: ft.Page):
     page.padding = 0
 
     state = {
+        "book_id": None,
+        "meta": None,
         "pages": [],
         "index": 0,
         "audio": None,
         "playing": False,
         "name": "",
         "token": 0,        # invalidates stale playback
-        "session": 0,      # new PDF = new session
-        "cache": {},       # page index -> mp3 path
+        "session": 0,      # changes when another book is opened
+        "cache": {},       # page index -> saved mp3 path
         "inflight": {},    # page index -> running task
         "failed": {},      # page index -> time of last failure
+        "errors": {},      # page index -> what went wrong
+        "attempts": {},    # page index -> failed tries so far
         "bg": [],
-        "last_error": "",
         "pos": 0.0,        # seconds into the current page
         "dur": 0.0,        # length of the current page audio (seconds)
         "dragging": False,
         "view": "player",
     }
-    rows = []          # (container, icon) per page in the "All pages" list
+    rows = []          # (container, icon, subtitle, snippet) per page in "All pages"
     row_last = []      # last drawn state per row, to skip needless updates
 
     # ---------- controls: player view ----------
@@ -171,9 +330,10 @@ def main(page: ft.Page):
 
     title_text = ft.Text("Your audiobook", size=24, weight=ft.FontWeight.W_700, color=W,
                          max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)
-    status = ft.Text("Open a PDF to start listening", size=14, color=SOFT,
-                     max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)
-    prep_err = ft.Text("", size=11, color=ERR_RED, visible=False)
+    status = ft.Text("Add a PDF from the Library", size=14, color=SOFT,
+                     max_lines=3, overflow=ft.TextOverflow.ELLIPSIS)
+    prep_err = ft.Text("", size=11, color=ERR_RED, visible=False, max_lines=3,
+                       overflow=ft.TextOverflow.ELLIPSIS)
 
     seek_slider = ft.Slider(
         min=0, max=1, value=0, disabled=True,
@@ -196,14 +356,22 @@ def main(page: ft.Page):
                             tooltip=f"Forward {SKIP_SECONDS} seconds")
 
     # ---------- controls: pages view ----------
-    pages_sub = ft.Text("Open a PDF to see its pages", size=13, color=SOFT)
+    pages_title = ft.Text("All pages", size=22, weight=ft.FontWeight.W_700, color=W,
+                          max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)
+    pages_sub = ft.Text("No book open", size=13, color=SOFT)
     page_input = ft.TextField(
         label="Page", width=90, dense=True, text_align=ft.TextAlign.CENTER,
         keyboard_type=ft.KeyboardType.NUMBER, color=W, border_color=GLASS_BORDER,
     )
     ready_switch = ft.Switch(label="Ready only", value=False, active_color=PINK)
     pages_list = ft.ListView(controls=[], spacing=8, expand=True)
-    pages_empty = ft.Text("No pages yet. Open a PDF from the bottom bar.", size=14, color=SOFT)
+    pages_empty = ft.Text("No book open. Choose one from the Library.", size=14, color=SOFT)
+
+    # ---------- controls: library view ----------
+    library_sub = ft.Text("", size=13, color=SOFT)
+    library_list = ft.ListView(controls=[], spacing=10, expand=True)
+    library_empty = ft.Text("Nothing saved yet. Tap Add PDF to start your library.",
+                            size=14, color=SOFT)
 
     file_picker = ft.FilePicker()
     page.services.append(file_picker)
@@ -257,15 +425,20 @@ def main(page: ft.Page):
 
     def refresh_rows():
         only_ready = bool(ready_switch.value)
-        for i, (cont, icon) in enumerate(rows):
+        for i, (cont, icon, sub, snippet) in enumerate(rows):
             s = row_status(i)
-            key = (s, only_ready)
+            err = state["errors"].get(i, "") if s == "failed" else ""
+            key = (s, only_ready, err)
             if row_last[i] == key:
                 continue
             row_last[i] = key
             icon.icon, icon.color = ROW_ICON[s]
             cont.bgcolor = GLASS_STRONG if s == "current" else GLASS
             cont.visible = (not only_ready) or s in ("ready", "current")
+            if err:
+                sub.value, sub.color = f"Failed: {err} (tap to retry)", ERR_RED
+            else:
+                sub.value, sub.color = snippet, SOFT
 
     def build_rows():
         rows.clear()
@@ -273,14 +446,16 @@ def main(page: ft.Page):
         controls = []
         for i, text in enumerate(state["pages"]):
             icon = ft.Icon(ft.Icons.SCHEDULE_ROUNDED, size=22, color=FAINT)
+            snippet = short(text, 70)
+            sub = ft.Text(snippet, size=12, color=SOFT, max_lines=2,
+                          overflow=ft.TextOverflow.ELLIPSIS)
             cont = ft.Container(
                 content=ft.Row(
                     [
                         ft.Column(
                             [
                                 ft.Text(f"Page {i + 1}", size=15, weight=ft.FontWeight.W_600, color=W),
-                                ft.Text(short(text, 70), size=12, color=SOFT,
-                                        max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                                sub,
                             ],
                             spacing=2, expand=True,
                         ),
@@ -293,7 +468,7 @@ def main(page: ft.Page):
                 border=ft.Border.all(1, GLASS_BORDER),
                 ink=True, on_click=row_tap(i),
             )
-            rows.append((cont, icon))
+            rows.append((cont, icon, sub, snippet))
             row_last.append(None)
             controls.append(cont)
         pages_list.controls = controls
@@ -305,6 +480,7 @@ def main(page: ft.Page):
         n = len(pages)
         if n:
             title_text.value = state["name"]
+            pages_title.value = state["name"]
             cover_num.value = str(i + 1)
             cover_of.value = f"of {n} pages"
             preview.value = short(pages[i], 260)
@@ -319,11 +495,12 @@ def main(page: ft.Page):
             return
         text = f"Audio ready for {len(state['cache'])} of {n} pages"
         if state["failed"]:
-            text += f" - retrying {len(state['failed'])}"
+            text += f" - {len(state['failed'])} failed"
         head_sub.value = text
         pages_sub.value = text
-        if state["failed"] and state["last_error"]:
-            prep_err.value = f"Last problem: {state['last_error']}"
+        if state["failed"]:
+            idx = max(state["failed"], key=state["failed"].get)
+            prep_err.value = f"Page {idx + 1}: {state['errors'].get(idx, 'unknown problem')}"
             prep_err.visible = True
         else:
             prep_err.visible = False
@@ -334,21 +511,62 @@ def main(page: ft.Page):
         state["view"] = name
         player_view.visible = name == "player"
         pages_view.visible = name == "pages"
+        library_view.visible = name == "library"
         nav_player.icon_color = W if name == "player" else FAINT
         nav_pages.icon_color = W if name == "pages" else FAINT
+        nav_library.icon_color = W if name == "library" else FAINT
+        page.update()
+
+    # ---------- library list ----------
+    def refresh_library():
+        books = list_books()
+        controls = []
+        for meta in books:
+            current = meta["id"] == state["book_id"]
+            mb = meta.get("audio_bytes", 0) / (1024 * 1024)
+            sub = (f"{meta['n_pages']} pages  |  page {meta.get('last_page', 0) + 1}  |  "
+                   f"audio {meta['audio_ready']}/{meta['n_pages']}  |  {mb:.0f} MB")
+            controls.append(ft.Container(
+                content=ft.Row(
+                    [
+                        ft.Icon(ft.Icons.PICTURE_AS_PDF_ROUNDED, size=28,
+                                color=PINK if current else SOFT),
+                        ft.Column(
+                            [
+                                ft.Text(meta["name"], size=15, weight=ft.FontWeight.W_600, color=W,
+                                        max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                                ft.Text(sub, size=12, color=SOFT, max_lines=2,
+                                        overflow=ft.TextOverflow.ELLIPSIS),
+                            ],
+                            spacing=2, expand=True,
+                        ),
+                        ft.IconButton(icon=ft.Icons.DELETE_OUTLINE_ROUNDED, icon_color=FAINT,
+                                      tooltip="Delete this book", on_click=delete_tap(meta)),
+                    ],
+                    vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=12,
+                ),
+                padding=ft.Padding(left=16, top=10, right=6, bottom=10),
+                border_radius=20, bgcolor=GLASS_STRONG if current else GLASS,
+                border=ft.Border.all(1, GLASS_BORDER),
+                ink=True, on_click=book_tap(meta["id"]),
+            ))
+        library_list.controls = controls
+        library_empty.visible = not controls
+        total = sum(m.get("audio_bytes", 0) for m in books) / (1024 * 1024)
+        library_sub.value = (f"{len(books)} saved  |  {total:.0f} MB of audio on this device"
+                             if books else "")
         page.update()
 
     # ---------- audio cache / prefetch ----------
-    async def _generate(idx, session):
-        final = os.path.join(tempfile.gettempdir(), f"page_{uuid.uuid4().hex}.mp3")
+    async def _generate(idx, session, book_id, text, allow_fallback):
+        os.makedirs(audio_dir(book_id), exist_ok=True)
+        final = audio_file(book_id, idx)
         part = final + ".part"
         try:
-            await synthesize(state["pages"][idx], part)
+            await synthesize(text, part, allow_fallback)
             os.replace(part, final)
             if session == state["session"]:
                 state["cache"][idx] = final
-            else:
-                os.remove(final)
             return final
         except BaseException:
             try:
@@ -360,13 +578,15 @@ def main(page: ft.Page):
             if session == state["session"]:
                 state["inflight"].pop(idx, None)
 
-    async def get_audio(idx):
+    async def get_audio(idx, urgent=False):
         cached = state["cache"].get(idx)
         if cached and os.path.exists(cached):
             return cached
         task = state["inflight"].get(idx)
         if task is None:
-            task = asyncio.create_task(_generate(idx, state["session"]))
+            task = asyncio.create_task(_generate(
+                idx, state["session"], state["book_id"], state["pages"][idx], urgent,
+            ))
             state["inflight"][idx] = task
             refresh_rows()
         return await asyncio.shield(task)
@@ -381,6 +601,7 @@ def main(page: ft.Page):
                 (i for i in range(start, end)
                  if i not in state["cache"]
                  and i not in state["inflight"]
+                 and state["attempts"].get(i, 0) < MAX_AUTO_RETRIES
                  and now - state["failed"].get(i, 0) > RETRY_COOLDOWN),
                 None,
             )
@@ -390,11 +611,14 @@ def main(page: ft.Page):
             try:
                 await get_audio(idx)
                 state["failed"].pop(idx, None)
+                state["errors"].pop(idx, None)
+                state["attempts"].pop(idx, None)
             except asyncio.CancelledError:
                 raise
             except Exception as err:
                 state["failed"][idx] = time.time()
-                state["last_error"] = f"page {idx + 1}: {str(err)[:70]}"
+                state["errors"][idx] = err_text(err)
+                state["attempts"][idx] = state["attempts"].get(idx, 0) + 1
             if session == state["session"]:
                 refresh_prep()
             await asyncio.sleep(0.2)
@@ -407,22 +631,114 @@ def main(page: ft.Page):
             for _ in range(WORKERS)
         ]
 
-    def reset_cache():
+    def reset_memory():
+        """Forget in-memory progress of the current book. Saved files are kept."""
         state["session"] += 1
         for t in state["bg"]:
             t.cancel()
         for t in list(state["inflight"].values()):
             t.cancel()
-        for p in state["cache"].values():
-            try:
-                os.remove(p)
-            except OSError:
-                pass
-        state["cache"].clear()
-        state["inflight"].clear()
-        state["failed"].clear()
+        state["cache"] = {}
+        state["inflight"] = {}
+        state["failed"] = {}
+        state["errors"] = {}
+        state["attempts"] = {}
         state["bg"] = []
-        state["last_error"] = ""
+
+    def save_progress():
+        meta = state["meta"]
+        if not meta:
+            return
+        meta["last_page"] = state["index"]
+        meta["last_opened"] = time.time()
+        try:
+            save_meta(meta)
+        except Exception:
+            pass
+
+    # ---------- opening / closing books ----------
+    def clear_book_ui():
+        state.update(book_id=None, meta=None, pages=[], index=0, name="")
+        build_rows()
+        title_text.value = "Your audiobook"
+        pages_title.value = "All pages"
+        pages_sub.value = "No book open"
+        cover_num.value = "-"
+        cover_of.value = "Open a PDF to begin"
+        preview.value = ""
+        head_sub.value = "No PDF loaded"
+        status.value = "Add a PDF from the Library"
+        prep_err.visible = False
+        reset_progress()
+        set_play_icon(False)
+
+    async def open_book(book_id, view="pages"):
+        await stop_audio()
+        reset_memory()
+        state["token"] += 1
+        status.value = "Opening..."
+        set_busy(True)
+        try:
+            meta = load_meta(book_id)
+            pages = await asyncio.to_thread(load_pages, book_id)
+            if not meta or not pages:
+                status.value = "This saved book could not be opened."
+                set_busy(False)
+                return
+            if meta.get("voice_tag") != VOICE_TAG:       # voice/rate changed: rebuild audio
+                await asyncio.to_thread(clear_audio, book_id)
+                meta["voice_tag"] = VOICE_TAG
+            state["book_id"] = book_id
+            state["meta"] = meta
+            state["pages"] = pages
+            state["name"] = meta["name"]
+            state["index"] = max(0, min(int(meta.get("last_page", 0)), len(pages) - 1))
+            state["cache"] = await asyncio.to_thread(scan_audio, book_id)
+            save_progress()
+            reset_progress()
+            build_rows()
+            refresh_ui()
+            refresh_prep()
+            start_prefetch()
+            status.value = f"Ready. Press play to continue from page {state['index'] + 1}."
+        except Exception as err:
+            status.value = f"Could not open this book: {err_text(err)}"
+        set_busy(False)
+        if view == "library":
+            refresh_library()
+        switch_view(view)
+
+    def book_tap(book_id):
+        async def handler(e):
+            await open_book(book_id, view="pages")
+        return handler
+
+    def delete_tap(meta):
+        async def handler(e):
+            def close(_=None):
+                page.pop_dialog()
+
+            async def confirm(_):
+                page.pop_dialog()
+                if meta["id"] == state["book_id"]:
+                    await stop_audio()
+                    reset_memory()
+                    state["token"] += 1
+                    clear_book_ui()
+                await asyncio.to_thread(delete_book, meta["id"])
+                refresh_library()
+
+            page.show_dialog(ft.AlertDialog(
+                modal=True,
+                title=ft.Text("Delete this book?"),
+                content=ft.Text(f"{meta['name']}\n\nThe saved text and audio will be removed "
+                                f"from this device."),
+                actions=[
+                    ft.TextButton("Cancel", on_click=close),
+                    ft.TextButton("Delete", on_click=confirm),
+                ],
+            ))
+        return handler
 
     # ---------- playback ----------
     async def stop_audio():
@@ -476,6 +792,7 @@ def main(page: ft.Page):
         my_token = state["token"]
         idx = state["index"]
         reset_progress()
+        save_progress()
         refresh_ui()
 
         if idx not in state["cache"]:
@@ -483,12 +800,27 @@ def main(page: ft.Page):
             set_busy(True)
 
         state["failed"].pop(idx, None)
+        state["attempts"].pop(idx, None)
         try:
-            path = await get_audio(idx)
+            try:
+                path = await get_audio(idx, urgent=True)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                # a background try may have failed just before; try once more,
+                # this time allowed to use the basic voice as a last resort
+                path = await get_audio(idx, urgent=True)
+        except asyncio.CancelledError:
+            raise
         except Exception as err:
-            status.value = f"Could not prepare page {idx + 1}: {str(err)[:80]}"
+            msg = err_text(err, 200)
+            state["failed"][idx] = time.time()
+            state["errors"][idx] = msg
+            status.value = f"Page {idx + 1} failed: {msg}"
             set_busy(False)
+            refresh_rows()
             return
+        state["errors"].pop(idx, None)
 
         if my_token != state["token"]:      # user skipped meanwhile
             return
@@ -526,29 +858,24 @@ def main(page: ft.Page):
             return
         f = files[0]
         await stop_audio()
-        reset_cache()
-        reset_progress()
-        status.value = "Reading the PDF..."
+        status.value = "Reading the PDF (only needed once)..."
+        switch_view("player")
         set_busy(True)
         try:
-            source = f.path if f.path else f.bytes
-            pages = await asyncio.to_thread(extract_pages, source)
-            if not pages:
-                state["pages"] = []
-                build_rows()
-                status.value = "No readable text found. Scanned PDFs are not supported."
+            if f.path:
+                data = await asyncio.to_thread(lambda: open(f.path, "rb").read())
             else:
-                state["pages"] = pages
-                state["index"] = 0
-                state["name"] = f.name
-                build_rows()
-                status.value = "Ready. Press play, or choose a page."
-                refresh_ui()
-                start_prefetch()
-                switch_view("player")
+                data = f.bytes
+            book_id, is_new = await asyncio.to_thread(import_pdf, data, f.name)
         except Exception as err:
-            status.value = f"Could not read this PDF: {str(err)[:80]}"
+            status.value = f"Could not read this PDF: {err_text(err, 160)}"
+            set_busy(False)
+            return
         set_busy(False)
+        await open_book(book_id, view="pages")
+        status.value = ("Saved to your library. Choose a page to play." if is_new
+                        else "Already in your library. Choose a page to play.")
+        page.update()
 
     async def play_click(e):
         if not state["pages"]:
@@ -647,6 +974,10 @@ def main(page: ft.Page):
         refresh_rows()
         switch_view("pages")
 
+    async def show_library(e):
+        refresh_library()
+        switch_view("library")
+
     play_btn.on_click = play_click
     prev_btn.on_click = prev_click
     next_btn.on_click = next_click
@@ -725,10 +1056,7 @@ def main(page: ft.Page):
 
     pages_view = ft.Column(
         [
-            ft.Row(
-                [ft.Text("All pages", size=22, weight=ft.FontWeight.W_700, color=W)],
-                alignment=ft.MainAxisAlignment.START,
-            ),
+            pages_title,
             pages_sub,
             ft.Row(
                 [page_input, ft.FilledButton(content="Go", on_click=go_click), ready_switch],
@@ -740,15 +1068,34 @@ def main(page: ft.Page):
         spacing=10, expand=True, visible=False,
     )
 
+    library_view = ft.Column(
+        [
+            ft.Row(
+                [
+                    ft.Text("Library", size=22, weight=ft.FontWeight.W_700, color=W),
+                    ft.FilledButton(
+                        content="Add PDF", icon=ft.Icons.ADD_ROUNDED, on_click=pick_pdf,
+                        style=ft.ButtonStyle(bgcolor=PLAY_BG, color=PLAY_FG),
+                    ),
+                ],
+                alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
+            ),
+            library_sub,
+            library_empty,
+            library_list,
+        ],
+        spacing=10, expand=True, visible=False,
+    )
+
     nav_player = ft.IconButton(icon=ft.Icons.HEADPHONES_ROUNDED, icon_size=26, icon_color=W,
                                tooltip="Player", on_click=show_player)
     nav_pages = ft.IconButton(icon=ft.Icons.FORMAT_LIST_NUMBERED_ROUNDED, icon_size=26,
                               icon_color=FAINT, tooltip="All pages", on_click=show_pages)
-    nav_open = ft.IconButton(icon=ft.Icons.FOLDER_OPEN_ROUNDED, icon_size=26, icon_color=FAINT,
-                             tooltip="Open PDF", on_click=pick_pdf)
+    nav_library = ft.IconButton(icon=ft.Icons.LIBRARY_BOOKS_ROUNDED, icon_size=26,
+                                icon_color=FAINT, tooltip="Library", on_click=show_library)
 
     nav_bar = glass(
-        ft.Row([nav_player, nav_pages, nav_open], alignment=ft.MainAxisAlignment.SPACE_AROUND),
+        ft.Row([nav_player, nav_pages, nav_library], alignment=ft.MainAxisAlignment.SPACE_AROUND),
         pad=ft.Padding(left=8, top=4, right=8, bottom=4), radius=26,
     )
 
@@ -766,7 +1113,7 @@ def main(page: ft.Page):
                     expand=True,
                     content=ft.Column(
                         [
-                            ft.Column([player_view, pages_view], expand=True),
+                            ft.Column([player_view, pages_view, library_view], expand=True),
                             nav_bar,
                         ],
                         expand=True, spacing=12,
@@ -775,6 +1122,20 @@ def main(page: ft.Page):
             ),
         )
     )
+
+    # ---------- start-up: reopen the last book, no waiting ----------
+    async def startup():
+        try:
+            books = await asyncio.to_thread(list_books)
+        except Exception:
+            books = []
+        if books:
+            await open_book(books[0]["id"], view="player")
+        else:
+            refresh_library()
+            switch_view("library")
+
+    page.run_task(startup)
 
 
 ft.run(main)
