@@ -3,6 +3,7 @@ import hashlib
 import io
 import json
 import os
+import random
 import re
 import shutil
 import time
@@ -27,21 +28,64 @@ RETRY_COOLDOWN = 20       # seconds before a failed page is tried again
 MAX_AUTO_RETRIES = 5      # then wait until you tap that page yourself
 CHUNK_CHARS = 2500        # long pages are sent in pieces
 SKIP_SECONDS = 10         # seconds for the skip back / forward buttons
+UP_NEXT_COUNT = 10        # cards in the "Up next" strip
 
-# ---------------- colours ----------------
+# ---------------- page pictures ----------------
+# 120 different pictures. Every page gets one at random (saved with the book,
+# so a page keeps its picture). Needs internet, same as the voice.
+IMAGE_SEEDS = [f"sona-{n:03d}" for n in range(1, 121)]
+DEFAULT_SEED = "sona-000"
+FIT_COVER = (getattr(ft, "BoxFit", None) or getattr(ft, "ImageFit")).COVER
+
+
+def cover_url(seed, size):
+    return f"https://picsum.photos/seed/{seed}/{size}/{size}"
+
+
+def make_covers(n):
+    """One picture per page, shuffled so neighbouring pages rarely look alike."""
+    out = []
+    while len(out) < n:
+        pool = IMAGE_SEEDS[:]
+        random.shuffle(pool)
+        out.extend(pool)
+    return out[:n]
+
+
+# ---------------- colours (midnight + violet) ----------------
 W = ft.Colors.WHITE
-GRAD_TOP, GRAD_MID, GRAD_BOT = "#8E7CF0", "#7C7EEC", "#6A8AE6"
-GLASS = ft.Colors.with_opacity(0.16, W)
-GLASS_STRONG = ft.Colors.with_opacity(0.30, W)
-GLASS_BORDER = ft.Colors.with_opacity(0.30, W)
-SOFT = ft.Colors.with_opacity(0.72, W)
-FAINT = ft.Colors.with_opacity(0.50, W)
-PINK = "#FFC4E6"
-PLAY_BG = "#F4F0FF"
-PLAY_FG = "#6A5BD8"
-OK_GREEN = "#A6F2CB"
-WAIT_YELLOW = "#FFE29A"
-ERR_RED = "#FFA3AE"
+BG = "#0B0819"
+SURFACE = "#1A1636"
+SURFACE_2 = "#251F4A"
+HAIRLINE = "#2F2960"
+TEXT = "#F4F1FF"
+MUTED = "#A9A4C9"
+DIM = "#6F6A93"
+ACCENT = "#6C63FF"
+ACCENT_2 = "#8B5CF6"
+ACCENT_LIGHT = "#B3A8FF"
+ACCENT_SOFT = ft.Colors.with_opacity(0.18, ACCENT)
+ACCENT_LINE = ft.Colors.with_opacity(0.65, ACCENT)
+MINT = "#5EE0B0"
+MINT_SOFT = ft.Colors.with_opacity(0.16, MINT)
+AMBER = "#F2C46D"
+AMBER_SOFT = ft.Colors.with_opacity(0.15, AMBER)
+ERR_RED = "#FF8A9B"
+ERR_SOFT = ft.Colors.with_opacity(0.15, ERR_RED)
+NEUTRAL_SOFT = ft.Colors.with_opacity(0.08, W)
+GLASS_BTN = ft.Colors.with_opacity(0.14, W)
+
+ACCENT_GRAD = ft.LinearGradient(
+    begin=ft.Alignment.TOP_LEFT, end=ft.Alignment.BOTTOM_RIGHT, colors=[ACCENT, ACCENT_2],
+)
+BG_DARK = ft.LinearGradient(
+    begin=ft.Alignment.TOP_CENTER, end=ft.Alignment.BOTTOM_CENTER,
+    colors=["#17113F", "#0B0819", "#08060F"],
+)
+BG_PLAYER = ft.LinearGradient(
+    begin=ft.Alignment.TOP_CENTER, end=ft.Alignment.BOTTOM_CENTER,
+    colors=["#7A48E0", "#4A2398", "#1B0F42"],
+)
 
 
 # ---------------- storage (saved books) ----------------
@@ -149,6 +193,7 @@ def import_pdf(data: bytes, name: str):
     save_meta({
         "id": book_id, "name": name, "n_pages": len(pages),
         "last_page": 0, "added": now, "last_opened": now, "voice_tag": VOICE_TAG,
+        "done": [], "covers": make_covers(len(pages)),
     })
     return book_id, True
 
@@ -227,6 +272,30 @@ def err_text(err, n=110):
     return f"{name}: {msg}"[:n] if msg else name
 
 
+def bar_controls(frac, color=MINT, h=4):
+    """A thin progress bar made of two flexible pieces (fill + track)."""
+    frac = max(0.0, min(1.0, frac))
+    r = h / 2
+    if frac <= 0:
+        return [ft.Container(expand=1, height=h, bgcolor=HAIRLINE, border_radius=r)]
+    if frac >= 1:
+        return [ft.Container(expand=1, height=h, bgcolor=color, border_radius=r)]
+    a = max(1, min(999, int(frac * 1000)))
+    return [
+        ft.Container(expand=a, height=h, bgcolor=color, border_radius=r),
+        ft.Container(expand=1000 - a, height=h, bgcolor=HAIRLINE, border_radius=r),
+    ]
+
+
+def thumb(seed, size, radius, opacity=1.0):
+    """Rounded square picture."""
+    return ft.Container(
+        content=ft.Image(src=cover_url(seed, size * 2), width=size, height=size, fit=FIT_COVER),
+        width=size, height=size, border_radius=radius, bgcolor=SURFACE_2,
+        clip_behavior=ft.ClipBehavior.ANTI_ALIAS, opacity=opacity,
+    )
+
+
 # ---------------- speech helpers ----------------
 async def fetch_chunk(chunk):
     comm = edge_tts.Communicate(chunk, VOICE, rate=RATE)
@@ -292,13 +361,14 @@ def mp3_duration(path):
 def main(page: ft.Page):
     page.title = "PDF Audiobook"
     page.theme_mode = ft.ThemeMode.DARK
-    page.bgcolor = GRAD_MID
+    page.bgcolor = BG
     page.padding = 0
 
     state = {
         "book_id": None,
         "meta": None,
         "pages": [],
+        "covers": [],      # picture seed per page
         "index": 0,
         "audio": None,
         "playing": False,
@@ -315,63 +385,93 @@ def main(page: ft.Page):
         "dur": 0.0,        # length of the current page audio (seconds)
         "dragging": False,
         "view": "player",
+        "done": set(),     # pages listened to the end (saved in meta.json)
+        "filter": "all",   # all | new | done | ready
+        "up_sig": None,    # which pages the "Up next" strip shows
     }
-    rows = []          # (container, icon, subtitle, snippet) per page in "All pages"
+    rows = []          # one dict per page in "All pages"
     row_last = []      # last drawn state per row, to skip needless updates
+    nav_refs = {}      # name -> (container, icon)
+    chip_refs = {}     # filter key -> (container, text)
+
+    def seed_of(i):
+        c = state["covers"]
+        return c[i] if 0 <= i < len(c) else DEFAULT_SEED
 
     # ---------- controls: player view ----------
-    head_sub = ft.Text("No PDF loaded", size=12, color=SOFT, text_align=ft.TextAlign.CENTER)
+    head_sub = ft.Text("No PDF loaded", size=12, color=ft.Colors.with_opacity(0.75, W),
+                       text_align=ft.TextAlign.CENTER)
     ring = ft.ProgressRing(visible=False, width=18, height=18, stroke_width=2, color=W)
 
-    cover_num = ft.Text("-", size=64, weight=ft.FontWeight.W_800, color=W)
-    cover_of = ft.Text("Open a PDF to begin", size=14, color=SOFT)
-    preview = ft.Text("", size=14, color=ft.Colors.with_opacity(0.9, W), selectable=True,
-                      text_align=ft.TextAlign.CENTER)
+    cover_img = ft.Image(src=cover_url(DEFAULT_SEED, 700), width=280, height=280, fit=FIT_COVER)
+    cover_sub = ft.Text("Open a PDF to begin", size=13, color=ft.Colors.with_opacity(0.75, W))
+    cover_badge = ft.Container(
+        content=ft.Row(
+            [ft.Icon(ft.Icons.DONE_ALL_ROUNDED, size=14, color=MINT),
+             ft.Text("Listened", size=12, weight=ft.FontWeight.W_600, color=MINT)],
+            spacing=6, tight=True,
+        ),
+        padding=ft.Padding(left=10, top=4, right=10, bottom=4),
+        border_radius=14, bgcolor=ft.Colors.with_opacity(0.28, "#000000"), visible=False,
+    )
+    preview = ft.Text("", size=12, color=ft.Colors.with_opacity(0.65, W), max_lines=3,
+                      overflow=ft.TextOverflow.ELLIPSIS)
 
-    title_text = ft.Text("Your audiobook", size=24, weight=ft.FontWeight.W_700, color=W,
+    title_text = ft.Text("Your audiobook", size=22, weight=ft.FontWeight.W_700, color=W,
                          max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)
-    status = ft.Text("Add a PDF from the Library", size=14, color=SOFT,
+    status = ft.Text("Add a PDF from the Library", size=14,
+                     color=ft.Colors.with_opacity(0.8, W),
                      max_lines=3, overflow=ft.TextOverflow.ELLIPSIS)
     prep_err = ft.Text("", size=11, color=ERR_RED, visible=False, max_lines=3,
                        overflow=ft.TextOverflow.ELLIPSIS)
 
     seek_slider = ft.Slider(
         min=0, max=1, value=0, disabled=True,
-        active_color=PINK, inactive_color=ft.Colors.with_opacity(0.3, W), thumb_color=W,
+        active_color=ACCENT_LIGHT, inactive_color=ft.Colors.with_opacity(0.22, W), thumb_color=W,
     )
-    pos_text = ft.Text("0:00", size=12, color=SOFT)
-    dur_text = ft.Text("0:00", size=12, color=SOFT)
+    pos_text = ft.Text("0:00", size=12, color=ft.Colors.with_opacity(0.75, W))
+    dur_text = ft.Text("0:00", size=12, color=ft.Colors.with_opacity(0.75, W))
 
-    play_btn = ft.FilledIconButton(
-        icon=ft.Icons.PLAY_ARROW_ROUNDED, icon_size=40, icon_color=PLAY_FG, bgcolor=PLAY_BG,
-        style=ft.ButtonStyle(shape=ft.CircleBorder(), padding=ft.Padding.all(20)),
-    )
-    prev_btn = ft.IconButton(icon=ft.Icons.SKIP_PREVIOUS_ROUNDED, icon_size=36, icon_color=W,
-                             tooltip="Previous page")
-    next_btn = ft.IconButton(icon=ft.Icons.SKIP_NEXT_ROUNDED, icon_size=36, icon_color=W,
-                             tooltip="Next page")
-    back_btn = ft.IconButton(icon=ft.Icons.REPLAY_10_ROUNDED, icon_size=28, icon_color=SOFT,
-                             tooltip=f"Back {SKIP_SECONDS} seconds")
-    fwd_btn = ft.IconButton(icon=ft.Icons.FORWARD_10_ROUNDED, icon_size=28, icon_color=SOFT,
-                            tooltip=f"Forward {SKIP_SECONDS} seconds")
+    glass_style = ft.ButtonStyle(shape=ft.CircleBorder(), bgcolor=GLASS_BTN)
+    play_btn = ft.IconButton(icon=ft.Icons.PLAY_ARROW_ROUNDED, icon_size=40, icon_color=W)
+    prev_btn = ft.IconButton(icon=ft.Icons.SKIP_PREVIOUS_ROUNDED, icon_size=28, icon_color=W,
+                             tooltip="Previous page", style=glass_style)
+    next_btn = ft.IconButton(icon=ft.Icons.SKIP_NEXT_ROUNDED, icon_size=28, icon_color=W,
+                             tooltip="Next page", style=glass_style)
+    back_btn = ft.IconButton(icon=ft.Icons.REPLAY_10_ROUNDED, icon_size=22,
+                             icon_color=ft.Colors.with_opacity(0.85, W),
+                             tooltip=f"Back {SKIP_SECONDS} seconds", style=glass_style)
+    fwd_btn = ft.IconButton(icon=ft.Icons.FORWARD_10_ROUNDED, icon_size=22,
+                            icon_color=ft.Colors.with_opacity(0.85, W),
+                            tooltip=f"Forward {SKIP_SECONDS} seconds", style=glass_style)
 
     # ---------- controls: pages view ----------
-    pages_title = ft.Text("All pages", size=22, weight=ft.FontWeight.W_700, color=W,
+    pages_title = ft.Text("All pages", size=24, weight=ft.FontWeight.W_800, color=TEXT,
                           max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)
-    pages_sub = ft.Text("No book open", size=13, color=SOFT)
+    stat_num = ft.Text("0", size=34, weight=ft.FontWeight.W_800, color=MINT)
+    stat_of = ft.Text("of 0 pages listened", size=14, color=MUTED)
+    stat_bar = ft.Row(bar_controls(0), spacing=0)
+    pages_sub = ft.Text("No book open", size=12, color=DIM)
     page_input = ft.TextField(
-        label="Page", width=90, dense=True, text_align=ft.TextAlign.CENTER,
-        keyboard_type=ft.KeyboardType.NUMBER, color=W, border_color=GLASS_BORDER,
+        label="Page", width=92, dense=True, text_align=ft.TextAlign.CENTER,
+        keyboard_type=ft.KeyboardType.NUMBER, color=TEXT, bgcolor=SURFACE,
+        border_color=HAIRLINE, focused_border_color=ACCENT, border_radius=14,
     )
-    ready_switch = ft.Switch(label="Ready only", value=False, active_color=PINK)
+    hint_text = ft.Text("Tap a page to play  ·  hold to mark it listened or not",
+                        size=11, color=DIM)
+    pages_empty = ft.Text("No book open. Choose one from the Library.", size=14, color=MUTED)
+    up_strip = ft.Row([], spacing=14, scroll=ft.ScrollMode.AUTO)
+    upnext_section = ft.Column(
+        [ft.Text("Up next", size=17, weight=ft.FontWeight.W_700, color=TEXT), up_strip],
+        spacing=10, visible=False,
+    )
     pages_list = ft.ListView(controls=[], spacing=8, expand=True)
-    pages_empty = ft.Text("No book open. Choose one from the Library.", size=14, color=SOFT)
 
     # ---------- controls: library view ----------
-    library_sub = ft.Text("", size=13, color=SOFT)
+    library_sub = ft.Text("", size=13, color=MUTED)
     library_list = ft.ListView(controls=[], spacing=10, expand=True)
     library_empty = ft.Text("Nothing saved yet. Tap Add PDF to start your library.",
-                            size=14, color=SOFT)
+                            size=14, color=MUTED)
 
     file_picker = ft.FilePicker()
     page.services.append(file_picker)
@@ -407,6 +507,8 @@ def main(page: ft.Page):
     def row_status(i):
         if i == state["index"]:
             return "current"
+        if i in state["done"]:
+            return "done"
         if i in state["cache"]:
             return "ready"
         if i in state["inflight"]:
@@ -415,65 +517,115 @@ def main(page: ft.Page):
             return "failed"
         return "wait"
 
-    ROW_ICON = {
-        "current": (ft.Icons.GRAPHIC_EQ_ROUNDED, W),
-        "ready": (ft.Icons.CHECK_CIRCLE_ROUNDED, OK_GREEN),
-        "loading": (ft.Icons.HOURGLASS_TOP_ROUNDED, WAIT_YELLOW),
-        "failed": (ft.Icons.ERROR_OUTLINE_ROUNDED, ERR_RED),
-        "wait": (ft.Icons.SCHEDULE_ROUNDED, FAINT),
+    # status -> (icon, icon colour, badge bg, row bg, row border, label, label colour)
+    ROW_STYLE = {
+        "current": (ft.Icons.GRAPHIC_EQ_ROUNDED, W, ACCENT, SURFACE_2, ACCENT_LINE,
+                    "Now playing", ACCENT_LIGHT),
+        "done": (ft.Icons.CHECK_ROUNDED, MINT, MINT_SOFT, SURFACE, HAIRLINE,
+                 "Listened", MINT),
+        "ready": (ft.Icons.PLAY_ARROW_ROUNDED, TEXT, NEUTRAL_SOFT, SURFACE, HAIRLINE,
+                  "Audio ready", MUTED),
+        "loading": (ft.Icons.HOURGLASS_TOP_ROUNDED, AMBER, AMBER_SOFT, SURFACE, HAIRLINE,
+                    "Preparing audio", AMBER),
+        "failed": (ft.Icons.ERROR_OUTLINE_ROUNDED, ERR_RED, ERR_SOFT, SURFACE, HAIRLINE,
+                   "Failed", ERR_RED),
+        "wait": (ft.Icons.SCHEDULE_ROUNDED, DIM, NEUTRAL_SOFT, SURFACE, HAIRLINE,
+                 "Queued", DIM),
     }
 
+    def passes_filter(i):
+        f = state["filter"]
+        if f == "all" or i == state["index"]:
+            return True
+        if f == "new":
+            return i not in state["done"]
+        if f == "done":
+            return i in state["done"]
+        if f == "ready":
+            return i in state["cache"]
+        return True
+
     def refresh_rows():
-        only_ready = bool(ready_switch.value)
-        for i, (cont, icon, sub, snippet) in enumerate(rows):
+        for i, r in enumerate(rows):
             s = row_status(i)
             err = state["errors"].get(i, "") if s == "failed" else ""
-            key = (s, only_ready, err)
+            is_done = i in state["done"]
+            key = (s, state["filter"], err, is_done)
             if row_last[i] == key:
                 continue
             row_last[i] = key
-            icon.icon, icon.color = ROW_ICON[s]
-            cont.bgcolor = GLASS_STRONG if s == "current" else GLASS
-            cont.visible = (not only_ready) or s in ("ready", "current")
+            icon_name, icon_col, badge_bg, row_bg, row_border, label, label_col = ROW_STYLE[s]
+            r["icon"].icon, r["icon"].color = icon_name, icon_col
+            r["badge"].bgcolor = badge_bg
+            r["cont"].bgcolor = row_bg
+            r["cont"].border = ft.Border.all(1, row_border)
+            r["cont"].visible = passes_filter(i)
+            r["thumb"].opacity = 0.5 if (is_done and s != "current") else 1.0
+            r["title"].color = MUTED if (is_done and s != "current") else TEXT
             if err:
-                sub.value, sub.color = f"Failed: {err} (tap to retry)", ERR_RED
-            else:
-                sub.value, sub.color = snippet, SOFT
+                label = f"Failed: {err} (tap to retry)"
+            elif s == "current" and is_done:
+                label = "Now playing  ·  listened"
+            r["label"].value = f"Page {i + 1}  ·  {label}"
+            r["label"].color = label_col
 
     def build_rows():
         rows.clear()
         row_last.clear()
-        controls = []
+        state["up_sig"] = None
+        row_controls = []
         for i, text in enumerate(state["pages"]):
-            icon = ft.Icon(ft.Icons.SCHEDULE_ROUNDED, size=22, color=FAINT)
-            snippet = short(text, 70)
-            sub = ft.Text(snippet, size=12, color=SOFT, max_lines=2,
-                          overflow=ft.TextOverflow.ELLIPSIS)
+            th = thumb(seed_of(i), 56, 16)
+            title = ft.Text(short(text, 70), size=14, weight=ft.FontWeight.W_600, color=TEXT,
+                            max_lines=2, overflow=ft.TextOverflow.ELLIPSIS)
+            label = ft.Text("", size=11, weight=ft.FontWeight.W_500, color=DIM,
+                            max_lines=2, overflow=ft.TextOverflow.ELLIPSIS)
+            icon = ft.Icon(ft.Icons.SCHEDULE_ROUNDED, size=20, color=DIM)
+            badge = ft.Container(
+                content=icon, width=40, height=40, border_radius=14,
+                alignment=ft.Alignment.CENTER, bgcolor=NEUTRAL_SOFT,
+            )
             cont = ft.Container(
                 content=ft.Row(
-                    [
-                        ft.Column(
-                            [
-                                ft.Text(f"Page {i + 1}", size=15, weight=ft.FontWeight.W_600, color=W),
-                                sub,
-                            ],
-                            spacing=2, expand=True,
-                        ),
-                        icon,
-                    ],
+                    [th, ft.Column([title, label], spacing=4, expand=True), badge],
                     vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=12,
                 ),
-                padding=ft.Padding(left=16, top=12, right=16, bottom=12),
-                border_radius=18, bgcolor=GLASS,
-                border=ft.Border.all(1, GLASS_BORDER),
-                ink=True, on_click=row_tap(i),
+                padding=ft.Padding(left=10, top=10, right=12, bottom=10),
+                border_radius=20, bgcolor=SURFACE,
+                border=ft.Border.all(1, HAIRLINE),
+                ink=True, on_click=row_tap(i), on_long_press=row_hold(i),
             )
-            rows.append((cont, icon, sub, snippet))
+            rows.append({"cont": cont, "icon": icon, "badge": badge, "thumb": th,
+                         "title": title, "label": label})
             row_last.append(None)
-            controls.append(cont)
-        pages_list.controls = controls
-        pages_empty.visible = not controls
+            row_controls.append(cont)
+        pages_list.controls = [pages_header] + row_controls
+        pages_empty.visible = not row_controls
         refresh_rows()
+        refresh_upnext()
+
+    def refresh_upnext():
+        n = len(state["pages"])
+        ids = [i for i in range(state["index"] + 1, n) if i not in state["done"]][:UP_NEXT_COUNT]
+        if ids == state["up_sig"]:
+            return
+        state["up_sig"] = ids
+        cards = []
+        for i in ids:
+            cards.append(ft.Container(
+                content=ft.Column(
+                    [
+                        thumb(seed_of(i), 128, 22),
+                        ft.Text(f"Page {i + 1}", size=13, weight=ft.FontWeight.W_700, color=TEXT),
+                        ft.Text(short(state["pages"][i], 40), size=11, color=MUTED, max_lines=2,
+                                overflow=ft.TextOverflow.ELLIPSIS),
+                    ],
+                    spacing=5,
+                ),
+                width=128, ink=True, border_radius=22, on_click=row_tap(i),
+            ))
+        up_strip.controls = cards
+        upnext_section.visible = bool(cards)
 
     def refresh_ui():
         pages, i = state["pages"], state["index"]
@@ -481,23 +633,30 @@ def main(page: ft.Page):
         if n:
             title_text.value = state["name"]
             pages_title.value = state["name"]
-            cover_num.value = str(i + 1)
-            cover_of.value = f"of {n} pages"
-            preview.value = short(pages[i], 260)
+            cover_img.src = cover_url(seed_of(i), 700)
+            cover_sub.value = f"Page {i + 1} of {n}"
+            cover_badge.visible = i in state["done"]
+            preview.value = short(pages[i], 200)
             page_input.value = str(i + 1)
             page_input.error_text = None
             refresh_rows()
+            refresh_upnext()
         page.update()
 
     def refresh_prep():
         n = len(state["pages"])
         if not n:
             return
-        text = f"Audio ready for {len(state['cache'])} of {n} pages"
+        listened = len(state["done"])
+        head_sub.value = f"{listened} of {n} listened  ·  audio ready {len(state['cache'])}/{n}"
+        stat_num.value = str(listened)
+        stat_of.value = f"of {n} pages listened"
+        stat_bar.controls = bar_controls(listened / n)
+        sub = f"Audio ready for {len(state['cache'])} of {n} pages"
         if state["failed"]:
-            text += f" - {len(state['failed'])} failed"
-        head_sub.value = text
-        pages_sub.value = text
+            sub += f"  ·  {len(state['failed'])} failed"
+        pages_sub.value = sub
+        cover_badge.visible = state["index"] in state["done"]
         if state["failed"]:
             idx = max(state["failed"], key=state["failed"].get)
             prep_err.value = f"Page {idx + 1}: {state['errors'].get(idx, 'unknown problem')}"
@@ -505,6 +664,7 @@ def main(page: ft.Page):
         else:
             prep_err.visible = False
         refresh_rows()
+        refresh_upnext()
         page.update()
 
     def switch_view(name):
@@ -512,10 +672,20 @@ def main(page: ft.Page):
         player_view.visible = name == "player"
         pages_view.visible = name == "pages"
         library_view.visible = name == "library"
-        nav_player.icon_color = W if name == "player" else FAINT
-        nav_pages.icon_color = W if name == "pages" else FAINT
-        nav_library.icon_color = W if name == "library" else FAINT
+        bg_box.gradient = BG_PLAYER if name == "player" else BG_DARK
+        for key, (cont, icon) in nav_refs.items():
+            on = key == name
+            cont.gradient = ACCENT_GRAD if on else None
+            icon.color = W if on else DIM
         page.update()
+
+    def style_chips():
+        for key, (cont, txt) in chip_refs.items():
+            on = key == state["filter"]
+            cont.bgcolor = ACCENT if on else SURFACE
+            cont.border = ft.Border.all(1, ACCENT if on else HAIRLINE)
+            txt.color = W if on else MUTED
+            txt.weight = ft.FontWeight.W_700 if on else ft.FontWeight.W_500
 
     # ---------- library list ----------
     def refresh_library():
@@ -523,37 +693,50 @@ def main(page: ft.Page):
         controls = []
         for meta in books:
             current = meta["id"] == state["book_id"]
+            n = max(1, meta["n_pages"])
+            listened = len(state["done"]) if current else len(meta.get("done", []))
+            covers = meta.get("covers") or [DEFAULT_SEED]
             mb = meta.get("audio_bytes", 0) / (1024 * 1024)
-            sub = (f"{meta['n_pages']} pages  |  page {meta.get('last_page', 0) + 1}  |  "
-                   f"audio {meta['audio_ready']}/{meta['n_pages']}  |  {mb:.0f} MB")
+            sub = (f"{meta['n_pages']} pages  ·  on page {meta.get('last_page', 0) + 1}  ·  "
+                   f"{mb:.0f} MB audio")
             controls.append(ft.Container(
-                content=ft.Row(
+                content=ft.Column(
                     [
-                        ft.Icon(ft.Icons.PICTURE_AS_PDF_ROUNDED, size=28,
-                                color=PINK if current else SOFT),
-                        ft.Column(
+                        ft.Row(
                             [
-                                ft.Text(meta["name"], size=15, weight=ft.FontWeight.W_600, color=W,
-                                        max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
-                                ft.Text(sub, size=12, color=SOFT, max_lines=2,
-                                        overflow=ft.TextOverflow.ELLIPSIS),
+                                thumb(covers[0], 56, 16),
+                                ft.Column(
+                                    [
+                                        ft.Text(meta["name"], size=15, weight=ft.FontWeight.W_700,
+                                                color=TEXT, max_lines=1,
+                                                overflow=ft.TextOverflow.ELLIPSIS),
+                                        ft.Text(sub, size=12, color=MUTED, max_lines=2,
+                                                overflow=ft.TextOverflow.ELLIPSIS),
+                                    ],
+                                    spacing=3, expand=True,
+                                ),
+                                ft.IconButton(icon=ft.Icons.DELETE_OUTLINE_ROUNDED,
+                                              icon_color=DIM, tooltip="Delete this book",
+                                              on_click=delete_tap(meta)),
                             ],
-                            spacing=2, expand=True,
+                            vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=12,
                         ),
-                        ft.IconButton(icon=ft.Icons.DELETE_OUTLINE_ROUNDED, icon_color=FAINT,
-                                      tooltip="Delete this book", on_click=delete_tap(meta)),
+                        ft.Container(content=ft.Row(bar_controls(listened / n), spacing=0),
+                                     padding=ft.Padding(left=0, top=0, right=8, bottom=0)),
+                        ft.Text(f"{listened} of {meta['n_pages']} pages listened", size=11,
+                                color=MINT if listened else DIM),
                     ],
-                    vertical_alignment=ft.CrossAxisAlignment.CENTER, spacing=12,
+                    spacing=8,
                 ),
-                padding=ft.Padding(left=16, top=10, right=6, bottom=10),
-                border_radius=20, bgcolor=GLASS_STRONG if current else GLASS,
-                border=ft.Border.all(1, GLASS_BORDER),
+                padding=ft.Padding(left=10, top=10, right=4, bottom=12),
+                border_radius=22, bgcolor=SURFACE_2 if current else SURFACE,
+                border=ft.Border.all(1, ACCENT_LINE if current else HAIRLINE),
                 ink=True, on_click=book_tap(meta["id"]),
             ))
         library_list.controls = controls
         library_empty.visible = not controls
         total = sum(m.get("audio_bytes", 0) for m in books) / (1024 * 1024)
-        library_sub.value = (f"{len(books)} saved  |  {total:.0f} MB of audio on this device"
+        library_sub.value = (f"{len(books)} saved  ·  {total:.0f} MB of audio on this device"
                              if books else "")
         page.update()
 
@@ -651,6 +834,7 @@ def main(page: ft.Page):
             return
         meta["last_page"] = state["index"]
         meta["last_opened"] = time.time()
+        meta["done"] = sorted(state["done"])
         try:
             save_meta(meta)
         except Exception:
@@ -658,13 +842,18 @@ def main(page: ft.Page):
 
     # ---------- opening / closing books ----------
     def clear_book_ui():
-        state.update(book_id=None, meta=None, pages=[], index=0, name="")
+        state.update(book_id=None, meta=None, pages=[], covers=[], index=0, name="",
+                     done=set())
         build_rows()
         title_text.value = "Your audiobook"
         pages_title.value = "All pages"
         pages_sub.value = "No book open"
-        cover_num.value = "-"
-        cover_of.value = "Open a PDF to begin"
+        stat_num.value = "0"
+        stat_of.value = "of 0 pages listened"
+        stat_bar.controls = bar_controls(0)
+        cover_img.src = cover_url(DEFAULT_SEED, 700)
+        cover_sub.value = "Open a PDF to begin"
+        cover_badge.visible = False
         preview.value = ""
         head_sub.value = "No PDF loaded"
         status.value = "Add a PDF from the Library"
@@ -688,12 +877,18 @@ def main(page: ft.Page):
             if meta.get("voice_tag") != VOICE_TAG:       # voice/rate changed: rebuild audio
                 await asyncio.to_thread(clear_audio, book_id)
                 meta["voice_tag"] = VOICE_TAG
+            covers = meta.get("covers")
+            if not covers or len(covers) != len(pages):  # older books get pictures too
+                covers = make_covers(len(pages))
+                meta["covers"] = covers
             state["book_id"] = book_id
             state["meta"] = meta
             state["pages"] = pages
+            state["covers"] = covers
             state["name"] = meta["name"]
             state["index"] = max(0, min(int(meta.get("last_page", 0)), len(pages) - 1))
             state["cache"] = await asyncio.to_thread(scan_audio, book_id)
+            state["done"] = {int(i) for i in meta.get("done", []) if 0 <= int(i) < len(pages)}
             save_progress()
             reset_progress()
             build_rows()
@@ -731,8 +926,8 @@ def main(page: ft.Page):
             page.show_dialog(ft.AlertDialog(
                 modal=True,
                 title=ft.Text("Delete this book?"),
-                content=ft.Text(f"{meta['name']}\n\nThe saved text and audio will be removed "
-                                f"from this device."),
+                content=ft.Text(f"{meta['name']}\n\nThe saved text, audio and listening "
+                                f"progress will be removed from this device."),
                 actions=[
                     ft.TextButton("Cancel", on_click=close),
                     ft.TextButton("Delete", on_click=confirm),
@@ -756,9 +951,14 @@ def main(page: ft.Page):
                 pass
         set_play_icon(False)
 
-    async def advance(my_token):
+    async def advance(my_token, finished=True):
         if my_token != state["token"]:      # already moved on
             return
+        state["token"] += 1                 # stops tracker + "completed" from both firing
+        if finished:
+            state["done"].add(state["index"])
+            save_progress()
+            refresh_prep()
         state["playing"] = False
         if state["index"] < len(state["pages"]) - 1:
             status.value = f"Page {state['index'] + 1} finished"
@@ -932,13 +1132,26 @@ def main(page: ft.Page):
             await go_to_page(i + 1)
         return handler
 
+    def row_hold(i):
+        """Long-press a page to flip its listened mark by hand."""
+        async def handler(e):
+            if i in state["done"]:
+                state["done"].discard(i)
+            else:
+                state["done"].add(i)
+            save_progress()
+            row_last[i] = None
+            state["up_sig"] = None
+            refresh_prep()
+        return handler
+
     async def seek_to(seconds):
         a = state["audio"]
         if a is None or not state["dur"]:
             return
         seconds = max(0.0, seconds)
-        if seconds >= state["dur"] - 0.5:       # skipped past the end
-            await advance(state["token"])
+        if seconds >= state["dur"] - 0.5:       # reached the end (skip or drag)
+            await advance(state["token"], finished=True)
             return
         await a.seek(ft.Duration(milliseconds=int(seconds * 1000)))
         state["pos"] = seconds
@@ -961,22 +1174,24 @@ def main(page: ft.Page):
         state["dragging"] = False
         await seek_to(float(e.control.value))
 
-    def ready_toggled(e):
-        for i in range(len(row_last)):
-            row_last[i] = None
-        refresh_rows()
-        page.update()
+    def chip_tap(key):
+        async def handler(e):
+            state["filter"] = key
+            style_chips()
+            for i in range(len(row_last)):
+                row_last[i] = None
+            refresh_rows()
+            page.update()
+        return handler
 
-    async def show_player(e):
-        switch_view("player")
-
-    async def show_pages(e):
-        refresh_rows()
-        switch_view("pages")
-
-    async def show_library(e):
-        refresh_library()
-        switch_view("library")
+    def nav_tap(name):
+        async def handler(e):
+            if name == "pages":
+                refresh_rows()
+            elif name == "library":
+                refresh_library()
+            switch_view(name)
+        return handler
 
     play_btn.on_click = play_click
     prev_btn.on_click = prev_click
@@ -987,54 +1202,53 @@ def main(page: ft.Page):
     seek_slider.on_change = seek_dragging
     seek_slider.on_change_end = seek_drag_end
     page_input.on_submit = go_click
-    ready_switch.on_change = ready_toggled
 
-    # ---------- layout ----------
-    def glass(content, pad=18, radius=28):
-        return ft.Container(
-            content=content, padding=pad, border_radius=radius, bgcolor=GLASS,
-            border=ft.Border.all(1, GLASS_BORDER),
-        )
-
+    # ---------- layout: player ----------
     header = ft.Row(
         [
             ft.Container(width=40),
             ft.Column(
-                [ft.Text("Now Playing", size=16, weight=ft.FontWeight.W_600, color=W), head_sub],
+                [ft.Text("Now Playing", size=15, weight=ft.FontWeight.W_700, color=W),
+                 head_sub],
                 spacing=2, horizontal_alignment=ft.CrossAxisAlignment.CENTER,
             ),
-            ft.Container(content=ring, width=40, alignment=ft.Alignment.CENTER),
+            ft.Container(content=ring, width=40, alignment=ft.Alignment.CENTER_RIGHT),
         ],
         alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
     )
 
-    cover = ft.Container(
-        content=ft.Column(
-            [
-                ft.Icon(ft.Icons.HEADPHONES_ROUNDED, color=FAINT, size=30),
-                ft.Text("Page", size=14, color=SOFT),
-                cover_num,
-                cover_of,
-                ft.Container(height=6),
-                ft.Column([preview], scroll=ft.ScrollMode.AUTO, height=70,
-                          horizontal_alignment=ft.CrossAxisAlignment.CENTER),
-            ],
-            horizontal_alignment=ft.CrossAxisAlignment.CENTER,
-            alignment=ft.MainAxisAlignment.CENTER,
-            spacing=0,
-        ),
-        height=330, padding=20, border_radius=32,
-        gradient=ft.LinearGradient(
-            begin=ft.Alignment.TOP_LEFT, end=ft.Alignment.BOTTOM_RIGHT,
-            colors=["#E8A7E0", "#A98BEF", "#7F97EE"],
-        ),
-        border=ft.Border.all(1, GLASS_BORDER),
+    cover = ft.Row(
+        [
+            ft.Container(
+                content=cover_img, width=280, height=280, border_radius=30,
+                clip_behavior=ft.ClipBehavior.ANTI_ALIAS, bgcolor=ft.Colors.with_opacity(0.2, W),
+                border=ft.Border.all(1, ft.Colors.with_opacity(0.18, W)),
+                shadow=ft.BoxShadow(blur_radius=40, color=ft.Colors.with_opacity(0.45, "#000000"),
+                                    offset=ft.Offset(0, 16)),
+            )
+        ],
+        alignment=ft.MainAxisAlignment.CENTER,
     )
 
-    title_row = ft.Column([title_text, status, prep_err], spacing=3)
+    title_row = ft.Column(
+        [
+            title_text,
+            ft.Row([cover_sub, cover_badge], spacing=10,
+                   vertical_alignment=ft.CrossAxisAlignment.CENTER),
+            status, prep_err, preview,
+        ],
+        spacing=4,
+    )
+
+    play_circle = ft.Container(
+        content=play_btn, width=76, height=76, border_radius=38,
+        alignment=ft.Alignment.CENTER, gradient=ACCENT_GRAD,
+        shadow=ft.BoxShadow(blur_radius=28, color=ft.Colors.with_opacity(0.55, ACCENT),
+                            offset=ft.Offset(0, 10)),
+    )
 
     controls_row = ft.Row(
-        [back_btn, prev_btn, play_btn, next_btn, fwd_btn],
+        [back_btn, prev_btn, play_circle, next_btn, fwd_btn],
         alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
         vertical_alignment=ft.CrossAxisAlignment.CENTER,
     )
@@ -1054,28 +1268,62 @@ def main(page: ft.Page):
         spacing=16, expand=True, scroll=ft.ScrollMode.AUTO,
     )
 
-    pages_view = ft.Column(
+    # ---------- layout: pages ----------
+    def make_chip(key, label):
+        txt = ft.Text(label, size=13, color=MUTED, weight=ft.FontWeight.W_500)
+        cont = ft.Container(
+            content=txt,
+            padding=ft.Padding(left=16, top=8, right=16, bottom=8),
+            border_radius=22, bgcolor=SURFACE, border=ft.Border.all(1, HAIRLINE),
+            ink=True, on_click=chip_tap(key),
+        )
+        chip_refs[key] = (cont, txt)
+        return cont
+
+    filter_row = ft.Row(
+        [make_chip("all", "All"), make_chip("new", "Not listened"),
+         make_chip("done", "Listened"), make_chip("ready", "Audio ready")],
+        spacing=8, scroll=ft.ScrollMode.AUTO,
+    )
+    style_chips()
+
+    pages_header = ft.Column(
         [
             pages_title,
+            ft.Row([stat_num, stat_of], spacing=8,
+                   vertical_alignment=ft.CrossAxisAlignment.END),
+            stat_bar,
             pages_sub,
             ft.Row(
-                [page_input, ft.FilledButton(content="Go", on_click=go_click), ready_switch],
+                [
+                    page_input,
+                    ft.FilledButton(
+                        content="Go", on_click=go_click,
+                        style=ft.ButtonStyle(bgcolor=ACCENT, color=W),
+                    ),
+                ],
                 spacing=12, vertical_alignment=ft.CrossAxisAlignment.CENTER,
             ),
+            filter_row,
+            upnext_section,
+            ft.Text("All pages", size=17, weight=ft.FontWeight.W_700, color=TEXT),
+            hint_text,
             pages_empty,
-            pages_list,
         ],
-        spacing=10, expand=True, visible=False,
+        spacing=12,
     )
 
+    pages_view = ft.Column([pages_list], spacing=0, expand=True, visible=False)
+
+    # ---------- layout: library ----------
     library_view = ft.Column(
         [
             ft.Row(
                 [
-                    ft.Text("Library", size=22, weight=ft.FontWeight.W_700, color=W),
+                    ft.Text("Library", size=24, weight=ft.FontWeight.W_800, color=TEXT),
                     ft.FilledButton(
                         content="Add PDF", icon=ft.Icons.ADD_ROUNDED, on_click=pick_pdf,
-                        style=ft.ButtonStyle(bgcolor=PLAY_BG, color=PLAY_FG),
+                        style=ft.ButtonStyle(bgcolor=ACCENT, color=W),
                     ),
                 ],
                 alignment=ft.MainAxisAlignment.SPACE_BETWEEN,
@@ -1087,41 +1335,57 @@ def main(page: ft.Page):
         spacing=10, expand=True, visible=False,
     )
 
-    nav_player = ft.IconButton(icon=ft.Icons.HEADPHONES_ROUNDED, icon_size=26, icon_color=W,
-                               tooltip="Player", on_click=show_player)
-    nav_pages = ft.IconButton(icon=ft.Icons.FORMAT_LIST_NUMBERED_ROUNDED, icon_size=26,
-                              icon_color=FAINT, tooltip="All pages", on_click=show_pages)
-    nav_library = ft.IconButton(icon=ft.Icons.LIBRARY_BOOKS_ROUNDED, icon_size=26,
-                                icon_color=FAINT, tooltip="Library", on_click=show_library)
+    # ---------- layout: floating pill nav ----------
+    def nav_item(name, icon_name, tip):
+        on = name == "player"
+        icon = ft.Icon(icon_name, size=24, color=W if on else DIM)
+        cont = ft.Container(
+            content=icon, width=64, height=46, border_radius=23,
+            alignment=ft.Alignment.CENTER, gradient=ACCENT_GRAD if on else None,
+            ink=True, on_click=nav_tap(name), tooltip=tip,
+        )
+        nav_refs[name] = (cont, icon)
+        return cont
 
-    nav_bar = glass(
-        ft.Row([nav_player, nav_pages, nav_library], alignment=ft.MainAxisAlignment.SPACE_AROUND),
-        pad=ft.Padding(left=8, top=4, right=8, bottom=4), radius=26,
+    nav_bar = ft.Row(
+        [
+            ft.Container(
+                content=ft.Row(
+                    [
+                        nav_item("player", ft.Icons.HEADPHONES_ROUNDED, "Player"),
+                        nav_item("pages", ft.Icons.FORMAT_LIST_NUMBERED_ROUNDED, "Pages"),
+                        nav_item("library", ft.Icons.LIBRARY_BOOKS_ROUNDED, "Library"),
+                    ],
+                    spacing=6, tight=True,
+                ),
+                padding=6, border_radius=32,
+                bgcolor=ft.Colors.with_opacity(0.92, "#120E2B"),
+                border=ft.Border.all(1, ft.Colors.with_opacity(0.14, W)),
+                shadow=ft.BoxShadow(blur_radius=24, color=ft.Colors.with_opacity(0.5, "#000000"),
+                                    offset=ft.Offset(0, 8)),
+            )
+        ],
+        alignment=ft.MainAxisAlignment.CENTER,
     )
 
-    page.add(
-        ft.Container(
+    bg_box = ft.Container(
+        expand=True, gradient=BG_PLAYER,
+        content=ft.SafeArea(
             expand=True,
-            gradient=ft.LinearGradient(
-                begin=ft.Alignment.TOP_CENTER, end=ft.Alignment.BOTTOM_CENTER,
-                colors=[GRAD_TOP, GRAD_MID, GRAD_BOT],
-            ),
-            content=ft.SafeArea(
+            content=ft.Container(
+                padding=ft.Padding(left=20, top=8, right=20, bottom=12),
                 expand=True,
-                content=ft.Container(
-                    padding=ft.Padding(left=20, top=8, right=20, bottom=12),
-                    expand=True,
-                    content=ft.Column(
-                        [
-                            ft.Column([player_view, pages_view, library_view], expand=True),
-                            nav_bar,
-                        ],
-                        expand=True, spacing=12,
-                    ),
+                content=ft.Column(
+                    [
+                        ft.Column([player_view, pages_view, library_view], expand=True),
+                        nav_bar,
+                    ],
+                    expand=True, spacing=12,
                 ),
             ),
-        )
+        ),
     )
+    page.add(bg_box)
 
     # ---------- start-up: reopen the last book, no waiting ----------
     async def startup():
