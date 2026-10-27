@@ -2,8 +2,8 @@
 name = "pdf-audiobook"
 version = "0.1.0"
 dependencies = [
-  "flet==<0.28.3>",
-  "flet-audio==<1.0.5>",
+  "flet",
+  "flet-audio",
   "PyPDF2",
   "gTTS",
   "edge-tts",
