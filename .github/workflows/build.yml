@@ -4,6 +4,7 @@ on: [workflow_dispatch]
 jobs:
   build:
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -19,17 +20,46 @@ jobs:
       - run: pip install "flet==1.0.5" "flet-cli==1.0.5"
 
       - name: Restore keystore
-        run: echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > upload.jks
+        shell: bash
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > "$GITHUB_WORKSPACE/upload.jks"
+          ls -l "$GITHUB_WORKSPACE/upload.jks"
+
+      - name: Check keystore
+        shell: bash
+        run: |
+          keytool -list -keystore "$GITHUB_WORKSPACE/upload.jks" \
+            -storepass "${{ secrets.KEYSTORE_PASSWORD }}" -alias upload
 
       - name: Build APK
+        shell: bash
         env:
           FLET_ANDROID_SIGNING_KEY_STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           FLET_ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
         run: |
-          yes | flet build apk --verbose --build-number ${{ github.run_number }} 2>&1 | tee build.log
-          exit ${PIPESTATUS[1]}
+          flet build apk --verbose \
+            --build-number ${{ github.run_number }} \
+            --android-signing-key-store "$GITHUB_WORKSPACE/upload.jks" \
+            --android-signing-key-alias upload \
+            < <(yes) 2>&1 | tee build.log
 
       - name: Show real error
         if: failure()
+        shell: bash
         run: |
-          grep -n -i -E "what went wrong|execution failed|FAILURE|keystore|signing|error:|exception" build.log | head -40
+          grep -n -B3 -A15 -i -E "what went wrong|execution failed|keystore was tampered|invalid keystore|cannot recover key" build.log | head -120 || true
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: build/apk
