@@ -25,8 +25,11 @@ jobs:
         env:
           FLET_ANDROID_SIGNING_KEY_STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           FLET_ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-        run: >
-          flet build apk --yes --verbose
-          --build-number ${{ github.run_number }}
-          --android-signing-key-store "$GITHUB_WORKSPACE/upload.jks"
-          --android-signing-key-alias upload
+        run: |
+          yes | flet build apk --verbose --build-number ${{ github.run_number }} 2>&1 | tee build.log
+          exit ${PIPESTATUS[1]}
+
+      - name: Show real error
+        if: failure()
+        run: |
+          grep -n -i -E "what went wrong|execution failed|FAILURE|keystore|signing|error:|exception" build.log | head -40
