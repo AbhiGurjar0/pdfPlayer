@@ -30,6 +30,58 @@ CHUNK_CHARS = 2500        # long pages are sent in pieces
 SKIP_SECONDS = 10         # seconds for the skip back / forward buttons
 UP_NEXT_COUNT = 10        # cards in the "Up next" strip
 
+COVER = 210
+
+
+
+
+
+
+PALETTES = [
+    ("#6C63FF", "#B3A8FF"), ("#8B5CF6", "#F472B6"), ("#0EA5E9", "#6C63FF"),
+    ("#14B8A6", "#5EE0B0"), ("#F59E0B", "#EF4444"), ("#EC4899", "#8B5CF6"),
+    ("#3B82F6", "#22D3EE"), ("#10B981", "#3B82F6"), ("#F97316", "#EC4899"),
+    ("#7C3AED", "#2DD4BF"),
+]
+ART_ICONS = [
+    ft.Icons.AUTO_STORIES_ROUNDED, ft.Icons.MENU_BOOK_ROUNDED, ft.Icons.LIGHTBULB_ROUNDED,
+    ft.Icons.SELF_IMPROVEMENT_ROUNDED, ft.Icons.PSYCHOLOGY_ROUNDED, ft.Icons.SPA_ROUNDED,
+    ft.Icons.WB_SUNNY_ROUNDED, ft.Icons.NIGHTLIGHT_ROUNDED, ft.Icons.FILTER_VINTAGE_ROUNDED,
+    ft.Icons.EXPLORE_ROUNDED, ft.Icons.FLARE_ROUNDED, ft.Icons.BOLT_ROUNDED,
+]
+
+
+def art(seed, size, radius):
+    """Gradient cover with soft circles and an icon. Same seed = same picture."""
+    h = int(hashlib.md5(seed.encode()).hexdigest(), 16)
+    c1, c2 = PALETTES[h % len(PALETTES)]
+    icon = ART_ICONS[(h // 7) % len(ART_ICONS)]
+    flip = (h // 3) % 2 == 0
+    glow = ft.Colors.with_opacity(0.14, W)
+    return ft.Container(
+        width=size, height=size, border_radius=radius,
+        clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+        gradient=ft.LinearGradient(
+            begin=ft.Alignment.TOP_LEFT if flip else ft.Alignment.BOTTOM_LEFT,
+            end=ft.Alignment.BOTTOM_RIGHT if flip else ft.Alignment.TOP_RIGHT,
+            colors=[c1, c2],
+        ),
+        content=ft.Stack(
+            [
+                ft.Container(width=size * 0.9, height=size * 0.9, border_radius=size * 0.45,
+                             bgcolor=glow, left=-size * 0.3, top=-size * 0.3),
+                ft.Container(width=size * 0.7, height=size * 0.7, border_radius=size * 0.35,
+                             bgcolor=glow, right=-size * 0.2, bottom=-size * 0.2),
+                ft.Container(
+                    content=ft.Icon(icon, size=size * 0.42,
+                                    color=ft.Colors.with_opacity(0.92, W)),
+                    width=size, height=size, alignment=ft.Alignment.CENTER,
+                ),
+            ],
+            width=size, height=size,
+        ),
+    )
+    
 # ---------------- page pictures ----------------
 # 120 different pictures. Every page gets one at random (saved with the book,
 # so a page keeps its picture). Needs internet, same as the voice.
@@ -264,10 +316,15 @@ def short(text, n=420):
     return text if len(text) <= n else text[:n].rsplit(" ", 1)[0] + "..."
 
 
+NET_ERR = "No internet - can't reach the voice server. Retrying..."
+
+
 def err_text(err, n=110):
-    """Always says what kind of error it was, even when the message is empty
-    (a timeout has an empty message, which is why errors looked 'unknown')."""
     msg = str(err).strip()
+    low = msg.lower()
+    if any(k in low for k in ("cannot connect to host", "dns", "getaddrinfo",
+                              "name or service", "network is unreachable")):
+        return NET_ERR
     name = type(err).__name__
     return f"{name}: {msg}"[:n] if msg else name
 
@@ -288,12 +345,9 @@ def bar_controls(frac, color=MINT, h=4):
 
 
 def thumb(seed, size, radius, opacity=1.0):
-    """Rounded square picture."""
-    return ft.Container(
-        content=ft.Image(src=cover_url(seed, size * 2), width=size, height=size, fit=FIT_COVER),
-        width=size, height=size, border_radius=radius, bgcolor=SURFACE_2,
-        clip_behavior=ft.ClipBehavior.ANTI_ALIAS, opacity=opacity,
-    )
+    c = art(seed, size, radius)
+    c.opacity = opacity
+    return c
 
 
 # ---------------- speech helpers ----------------
@@ -403,7 +457,7 @@ def main(page: ft.Page):
                        text_align=ft.TextAlign.CENTER)
     ring = ft.ProgressRing(visible=False, width=18, height=18, stroke_width=2, color=W)
 
-    cover_img = ft.Image(src=cover_url(DEFAULT_SEED, 700), width=280, height=280, fit=FIT_COVER)
+    cover_img = ft.Container(content=art(DEFAULT_SEED, COVER, 0), width=COVER, height=COVER)
     cover_sub = ft.Text("Open a PDF to begin", size=13, color=ft.Colors.with_opacity(0.75, W))
     cover_badge = ft.Container(
         content=ft.Row(
@@ -414,14 +468,13 @@ def main(page: ft.Page):
         padding=ft.Padding(left=10, top=4, right=10, bottom=4),
         border_radius=14, bgcolor=ft.Colors.with_opacity(0.28, "#000000"), visible=False,
     )
-    preview = ft.Text("", size=12, color=ft.Colors.with_opacity(0.65, W), max_lines=3,
-                      overflow=ft.TextOverflow.ELLIPSIS)
-
-    title_text = ft.Text("Your audiobook", size=22, weight=ft.FontWeight.W_700, color=W,
-                         max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)
-    status = ft.Text("Add a PDF from the Library", size=14,
-                     color=ft.Colors.with_opacity(0.8, W),
-                     max_lines=3, overflow=ft.TextOverflow.ELLIPSIS)
+    title_text = ft.Text("Your audiobook", size=20, weight=ft.FontWeight.W_700, color=W,
+                     max_lines=1, overflow=ft.TextOverflow.ELLIPSIS)
+    status = ft.Text("Add a PDF from the Library", size=13,
+                 color=ft.Colors.with_opacity(0.8, W),
+                 max_lines=2, overflow=ft.TextOverflow.ELLIPSIS)
+    preview = ft.Text("", size=12, color=ft.Colors.with_opacity(0.65, W), max_lines=2,
+                  overflow=ft.TextOverflow.ELLIPSIS)
     prep_err = ft.Text("", size=11, color=ERR_RED, visible=False, max_lines=3,
                        overflow=ft.TextOverflow.ELLIPSIS)
 
@@ -636,7 +689,8 @@ def main(page: ft.Page):
             cover_img.src = cover_url(seed_of(i), 700)
             cover_sub.value = f"Page {i + 1} of {n}"
             cover_badge.visible = i in state["done"]
-            preview.value = short(pages[i], 200)
+            cover_img.content = art(seed_of(i), COVER, 0)
+            preview.value = short(pages[i], 110)
             page_input.value = str(i + 1)
             page_input.error_text = None
             refresh_rows()
@@ -801,7 +855,8 @@ def main(page: ft.Page):
             except Exception as err:
                 state["failed"][idx] = time.time()
                 state["errors"][idx] = err_text(err)
-                state["attempts"][idx] = state["attempts"].get(idx, 0) + 1
+                if err_text(err) != NET_ERR:          # no internet = keep retrying
+                    state["attempts"][idx] = state["attempts"].get(idx, 0) + 1
             if session == state["session"]:
                 refresh_prep()
             await asyncio.sleep(0.2)
@@ -853,6 +908,7 @@ def main(page: ft.Page):
         stat_bar.controls = bar_controls(0)
         cover_img.src = cover_url(DEFAULT_SEED, 700)
         cover_sub.value = "Open a PDF to begin"
+        cover_img.content = art(DEFAULT_SEED, COVER, 0)
         cover_badge.visible = False
         preview.value = ""
         head_sub.value = "No PDF loaded"
@@ -949,6 +1005,8 @@ def main(page: ft.Page):
                 page.services.remove(a)
             except ValueError:
                 pass
+            page.update()
+            await asyncio.sleep(0.15)   # let the old player fully unmount
         set_play_icon(False)
 
     async def advance(my_token, finished=True):
@@ -1036,11 +1094,22 @@ def main(page: ft.Page):
                 state["pos"] = e.position / 1000.0
 
         audio = fta.Audio(
-            src=path, autoplay=True,
+            src=path, autoplay=False,
             on_state_change=on_done, on_position_change=on_pos,
         )
         state["audio"] = audio
         page.services.append(audio)
+        page.update()
+        await asyncio.sleep(0.4)            # let the new player mount
+
+        if my_token != state["token"]:      # user skipped meanwhile
+            return
+        try:
+            await audio.play()
+        except Exception:
+            await asyncio.sleep(0.6)        # one retry if it wasn't ready yet
+            await audio.play()
+
         state["playing"] = True
         set_play_icon(True)
         reset_progress(duration)
@@ -1220,7 +1289,7 @@ def main(page: ft.Page):
     cover = ft.Row(
         [
             ft.Container(
-                content=cover_img, width=280, height=280, border_radius=30,
+                content=cover_img, width=COVER, height=COVER, border_radius=30,
                 clip_behavior=ft.ClipBehavior.ANTI_ALIAS, bgcolor=ft.Colors.with_opacity(0.2, W),
                 border=ft.Border.all(1, ft.Colors.with_opacity(0.18, W)),
                 shadow=ft.BoxShadow(blur_radius=40, color=ft.Colors.with_opacity(0.45, "#000000"),
@@ -1265,7 +1334,8 @@ def main(page: ft.Page):
             ),
             controls_row,
         ],
-        spacing=16, expand=True, scroll=ft.ScrollMode.AUTO,
+        spacing=8, expand=True,
+        alignment=ft.MainAxisAlignment.SPACE_EVENLY,
     )
 
     # ---------- layout: pages ----------
