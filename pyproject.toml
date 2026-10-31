@@ -9,3 +9,11 @@ dependencies = [
   "edge-tts",
   "mutagen",
 ]
+
+[tool.flet]
+org = "com.abhigurjar"
+product = "PDF Audiobook"
+
+[tool.flet.android.signing]
+key_store = "upload.jks"
+key_alias = "upload"
