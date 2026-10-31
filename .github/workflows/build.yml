@@ -25,9 +25,8 @@ jobs:
         env:
           FLET_ANDROID_SIGNING_KEY_STORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           FLET_ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-        run: yes | flet build apk --verbose --build-number ${{ github.run_number }}
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: apk
-          path: build/apk
+        run: >
+          flet build apk --yes --verbose
+          --build-number ${{ github.run_number }}
+          --android-signing-key-store "$GITHUB_WORKSPACE/upload.jks"
+          --android-signing-key-alias upload
