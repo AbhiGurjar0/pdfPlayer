@@ -35,8 +35,6 @@ COVER = 210
 
 
 
-
-
 PALETTES = [
     ("#6C63FF", "#B3A8FF"), ("#8B5CF6", "#F472B6"), ("#0EA5E9", "#6C63FF"),
     ("#14B8A6", "#5EE0B0"), ("#F59E0B", "#EF4444"), ("#EC4899", "#8B5CF6"),
@@ -51,37 +49,65 @@ ART_ICONS = [
 ]
 
 
+SCENES = [
+    {"sky": ["#0B1026", "#2B1B5E", "#6C3FA0"], "sun": "#F5F0FF", "night": True,
+     "hills": ["#241A5A", "#171040", "#0B0825"]},
+    {"sky": ["#1A1038", "#8B3A8F", "#F59E6B"], "sun": "#FFE3B0", "night": False,
+     "hills": ["#4A2160", "#2E1445", "#1A0B2B"]},
+    {"sky": ["#7EC8F5", "#BFE3F7", "#FFF1D6"], "sun": "#FFFFFF", "night": False,
+     "clouds": True, "hills": ["#9ED99A", "#6DB97A", "#3F8F5B"]},
+    {"sky": ["#0F2027", "#203A43", "#2C5364"], "sun": "#CFF5FF", "night": True,
+     "hills": ["#1F4E5F", "#14343F", "#0A1F28"]},
+    {"sky": ["#FF9A8B", "#FF6A88", "#B06AB3"], "sun": "#FFF0C9", "night": False,
+     "hills": ["#6B3A8C", "#43235F", "#2A1440"]},
+    {"sky": ["#0B0819", "#3A1C71", "#D76D77"], "sun": "#FFD6C2", "night": True,
+     "hills": ["#2A1450", "#190C33", "#0B0619"]},
+]
+
+
 def art(seed, size, radius):
-    """Gradient cover with soft circles and an icon. Same seed = same picture."""
-    h = int(hashlib.md5(seed.encode()).hexdigest(), 16)
-    c1, c2 = PALETTES[h % len(PALETTES)]
-    icon = ART_ICONS[(h // 7) % len(ART_ICONS)]
-    flip = (h // 3) % 2 == 0
-    glow = ft.Colors.with_opacity(0.14, W)
+    """Aesthetic scene: sky, stars or clouds, sun/moon glow, layered hills."""
+    rnd = random.Random(seed)
+    sc = rnd.choice(SCENES)
+    layers = []
+
+    if sc.get("night"):
+        for _ in range(26):
+            d = rnd.choice([1.5, 2, 2, 3])
+            layers.append(ft.Container(
+                width=d, height=d, border_radius=d,
+                bgcolor=ft.Colors.with_opacity(rnd.uniform(0.45, 1.0), W),
+                left=rnd.random() * size, top=rnd.random() * size * 0.55))
+
+    if sc.get("clouds"):
+        for _ in range(3):
+            cw = size * rnd.uniform(0.3, 0.5)
+            layers.append(ft.Container(
+                width=cw, height=cw * 0.35, border_radius=cw,
+                bgcolor=ft.Colors.with_opacity(0.75, W),
+                left=rnd.uniform(-0.1, 0.7) * size, top=rnd.uniform(0.08, 0.4) * size))
+
+    d = size * rnd.uniform(0.2, 0.3)
+    layers.append(ft.Container(
+        width=d, height=d, border_radius=d / 2, bgcolor=sc["sun"],
+        left=rnd.uniform(0.15, 0.65) * size, top=rnd.uniform(0.12, 0.35) * size,
+        shadow=ft.BoxShadow(blur_radius=size * 0.25, spread_radius=size * 0.02,
+                            color=ft.Colors.with_opacity(0.55, sc["sun"]))))
+
+    for k, col in enumerate(sc["hills"]):
+        hw = size * rnd.uniform(1.2, 1.7)
+        layers.append(ft.Container(
+            width=hw, height=hw, border_radius=hw / 2, bgcolor=col,
+            left=rnd.uniform(-0.6, -0.1) * size, top=size * (0.62 + 0.11 * k)))
+
     return ft.Container(
         width=size, height=size, border_radius=radius,
         clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
         gradient=ft.LinearGradient(
-            begin=ft.Alignment.TOP_LEFT if flip else ft.Alignment.BOTTOM_LEFT,
-            end=ft.Alignment.BOTTOM_RIGHT if flip else ft.Alignment.TOP_RIGHT,
-            colors=[c1, c2],
-        ),
-        content=ft.Stack(
-            [
-                ft.Container(width=size * 0.9, height=size * 0.9, border_radius=size * 0.45,
-                             bgcolor=glow, left=-size * 0.3, top=-size * 0.3),
-                ft.Container(width=size * 0.7, height=size * 0.7, border_radius=size * 0.35,
-                             bgcolor=glow, right=-size * 0.2, bottom=-size * 0.2),
-                ft.Container(
-                    content=ft.Icon(icon, size=size * 0.42,
-                                    color=ft.Colors.with_opacity(0.92, W)),
-                    width=size, height=size, alignment=ft.Alignment.CENTER,
-                ),
-            ],
-            width=size, height=size,
-        ),
-    )
-    
+            begin=ft.Alignment.TOP_CENTER, end=ft.Alignment.BOTTOM_CENTER,
+            colors=sc["sky"]),
+        content=ft.Stack(layers, width=size, height=size),
+    ) 
 # ---------------- page pictures ----------------
 # 120 different pictures. Every page gets one at random (saved with the book,
 # so a page keeps its picture). Needs internet, same as the voice.
@@ -513,7 +539,8 @@ def main(page: ft.Page):
     hint_text = ft.Text("Tap a page to play  ·  hold to mark it listened or not",
                         size=11, color=DIM)
     pages_empty = ft.Text("No book open. Choose one from the Library.", size=14, color=MUTED)
-    up_strip = ft.Row([], spacing=14, scroll=ft.ScrollMode.AUTO)
+    up_strip = ft.Row([], spacing=14, scroll=ft.ScrollMode.HIDDEN,
+                  vertical_alignment=ft.CrossAxisAlignment.START)
     upnext_section = ft.Column(
         [ft.Text("Up next", size=17, weight=ft.FontWeight.W_700, color=TEXT), up_strip],
         spacing=10, visible=False,
@@ -686,7 +713,7 @@ def main(page: ft.Page):
         if n:
             title_text.value = state["name"]
             pages_title.value = state["name"]
-            cover_img.src = cover_url(seed_of(i), 700)
+            
             cover_sub.value = f"Page {i + 1} of {n}"
             cover_badge.visible = i in state["done"]
             cover_img.content = art(seed_of(i), COVER, 0)
@@ -906,7 +933,7 @@ def main(page: ft.Page):
         stat_num.value = "0"
         stat_of.value = "of 0 pages listened"
         stat_bar.controls = bar_controls(0)
-        cover_img.src = cover_url(DEFAULT_SEED, 700)
+        
         cover_sub.value = "Open a PDF to begin"
         cover_img.content = art(DEFAULT_SEED, COVER, 0)
         cover_badge.visible = False
@@ -990,6 +1017,13 @@ def main(page: ft.Page):
                 ],
             ))
         return handler
+    
+    async def safe(coro, t=3):
+            try:
+                await asyncio.wait_for(coro, t)
+            except Exception:
+                pass
+    
 
     # ---------- playback ----------
     async def stop_audio():
@@ -997,10 +1031,7 @@ def main(page: ft.Page):
         state["audio"] = None
         state["playing"] = False
         if a is not None:
-            try:
-                await a.pause()
-            except Exception:
-                pass
+            await safe(a.pause())
             try:
                 page.services.remove(a)
             except ValueError:
@@ -1086,30 +1117,27 @@ def main(page: ft.Page):
         duration = mp3_duration(path) or 0.0
 
         async def on_done(e, t=my_token):
-            if str(e.state).lower().endswith("completed"):
-                await advance(t)
+            if not str(e.state).lower().endswith("completed"):
+                return
+            if t != state["token"] or not state["playing"]:
+                return                      # paused or stale: ignore
+            near_end = max(3.0, duration * 0.1)
+            if duration and state["pos"] < duration - near_end:
+                return                      # fired too early: ignore
+            await advance(t)
 
         def on_pos(e, t=my_token):
             if t == state["token"]:
                 state["pos"] = e.position / 1000.0
 
         audio = fta.Audio(
-            src=path, autoplay=False,
+            src=path, autoplay=True,        #
             on_state_change=on_done, on_position_change=on_pos,
         )
         state["audio"] = audio
         page.services.append(audio)
         page.update()
-        await asyncio.sleep(0.4)            # let the new player mount
-
-        if my_token != state["token"]:      # user skipped meanwhile
-            return
-        try:
-            await audio.play()
-        except Exception:
-            await asyncio.sleep(0.6)        # one retry if it wasn't ready yet
-            await audio.play()
-
+        
         state["playing"] = True
         set_play_icon(True)
         reset_progress(duration)
@@ -1145,19 +1173,20 @@ def main(page: ft.Page):
         status.value = ("Saved to your library. Choose a page to play." if is_new
                         else "Already in your library. Choose a page to play.")
         page.update()
-
+        
+   
     async def play_click(e):
         if not state["pages"]:
             return
         a = state["audio"]
         if a is not None and state["playing"]:
-            await a.pause()
             state["playing"] = False
             set_play_icon(False)
             status.value = "Paused"
             page.update()
+            await safe(a.pause())
         elif a is not None:
-            await a.resume()
+            await safe(a.resume())
             state["playing"] = True
             set_play_icon(True)
             status.value = f"Playing page {state['index'] + 1}"
@@ -1222,7 +1251,7 @@ def main(page: ft.Page):
         if seconds >= state["dur"] - 0.5:       # reached the end (skip or drag)
             await advance(state["token"], finished=True)
             return
-        await a.seek(ft.Duration(milliseconds=int(seconds * 1000)))
+        await safe(a.seek(ft.Duration(milliseconds=int(seconds * 1000))))
         state["pos"] = seconds
         refresh_progress()
 
@@ -1353,7 +1382,7 @@ def main(page: ft.Page):
     filter_row = ft.Row(
         [make_chip("all", "All"), make_chip("new", "Not listened"),
          make_chip("done", "Listened"), make_chip("ready", "Audio ready")],
-        spacing=8, scroll=ft.ScrollMode.AUTO,
+        spacing=8, scroll=ft.ScrollMode.HIDDEN,
     )
     style_chips()
 
